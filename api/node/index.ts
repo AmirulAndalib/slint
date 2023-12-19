@@ -171,16 +171,16 @@ export interface ImageData {
  * ```
  */
 export abstract class Model<T> {
+    private modelInner: napi.RustModel;
+
     /**
      * @hidden
      */
     notify: NullPeer;
 
-    #modelInner: napi.RustModel;
-
     constructor() {
         this.notify = new NullPeer();
-        this.#modelInner = new napi.RustModel();
+        this.modelInner = new napi.RustModel(this);
     }
 
     // /**
@@ -223,7 +223,7 @@ export abstract class Model<T> {
      * @param row index of the changed row.
      */
     protected notifyRowDataChanged(row: number): void {
-        this.#modelInner.notify_row_data_changed(row);
+        this.modelInner.notify_row_data_changed(row);
     }
 
     /**
@@ -232,7 +232,7 @@ export abstract class Model<T> {
      * @param count the number of added items.
      */
     protected notifyRowAdded(row: number, count: number): void {
-        this.#modelInner.notify_row_added(row, count);
+        this.modelInner.notify_row_added(row, count);
     }
 
     /**
@@ -241,14 +241,14 @@ export abstract class Model<T> {
      * @param count the number of removed items.
      */
     protected notifyRowRemoved(row: number, count: number): void {
-        this.#modelInner.notify_row_removed(row, count);
+        this.modelInner.notify_row_removed(row, count);
     }
 
     /**
      * Notifies the view that the complete data must be reload.
      */
     protected notifyReset(): void {
-        this.#modelInner.notify_reset();
+        this.modelInner.notify_reset();
     }
 }
 
