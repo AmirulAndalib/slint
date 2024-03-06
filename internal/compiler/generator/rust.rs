@@ -1428,11 +1428,14 @@ fn generate_item_tree(
             #window_adapter_functions
         }
 
+        const _ : () = {
+            use slint::private_unstable_api::re_exports::*;
+            ItemTreeVTable_static!(static VT for self::#inner_component_id);
+        };
+
         impl sp::PinnedDrop for #inner_component_id {
             fn drop(self: core::pin::Pin<&mut #inner_component_id>) {
-                use slint::private_unstable_api::re_exports::*;
-                ItemTreeVTable_static!(static VT for self::#inner_component_id);
-                new_vref!(let vref : VRef<sp::ItemTreeVTable> for sp::ItemTree = self.as_ref().get_ref());
+                sp::vtable::new_vref!(let vref : VRef<sp::ItemTreeVTable> for sp::ItemTree = self.as_ref().get_ref());
                 if let Some(wa) = self.maybe_window_adapter_impl() {
                     sp::unregister_item_tree(self.as_ref(), vref, Self::item_array(), &wa);
                 }
@@ -1661,8 +1664,10 @@ fn property_set_value_tokens(
     let prop = access_member(property, ctx);
     let prop_type = ctx.property_ty(property);
     let value_tokens = set_primitive_property_value(prop_type, value_tokens);
-    if let Some(animation) = ctx.current_sub_component.and_then(|c| c.animations.get(property)) {
-        let animation_tokens = compile_expression(animation, ctx);
+    if let Some((animation, map)) = &ctx.property_info(property).animation {
+        let mut animation = (*animation).clone();
+        map.map_expression(&mut animation);
+        let animation_tokens = compile_expression(&animation, ctx);
         return quote!(#prop.set_animated_value(#value_tokens as _, #animation_tokens));
     }
     quote!(#prop.set(#value_tokens as _))

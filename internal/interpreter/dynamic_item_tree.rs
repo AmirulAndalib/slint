@@ -9,8 +9,8 @@ use i_slint_compiler::diagnostics::SourceFileVersion;
 use i_slint_compiler::expression_tree::{Expression, NamedReference};
 use i_slint_compiler::langtype::{ElementType, Type};
 use i_slint_compiler::object_tree::ElementRc;
-use i_slint_compiler::*;
 use i_slint_compiler::{diagnostics::BuildDiagnostics, object_tree::PropertyDeclaration};
+use i_slint_compiler::{generator, object_tree, parser, CompilerConfiguration};
 use i_slint_core::accessibility::AccessibleStringProperty;
 use i_slint_core::component_factory::ComponentFactory;
 use i_slint_core::item_tree::{
@@ -379,6 +379,12 @@ pub struct ItemTreeDescription<'id> {
     /// Map of all exported global singletons and their index in the compiled_globals vector. The key
     /// is the normalized name of the global.
     exported_globals_by_name: BTreeMap<String, usize>,
+
+    /// The type loader, which will be available only on the top-most `ItemTreeDescription`.
+    /// All other `ItemTreeDescription`s have `None` here.
+    #[cfg(feature = "highlight")]
+    pub(crate) type_loader:
+        std::cell::OnceCell<std::rc::Rc<i_slint_compiler::typeloader::TypeLoader>>,
 }
 
 fn internal_properties_to_public<'a>(
@@ -781,24 +787,37 @@ pub async fn load(
         }
     }
 
-    let mut diag = BuildDiagnostics::default();
-    let syntax_node = parser::parse(source, Some(path.as_path()), version, &mut diag);
+    let diag = BuildDiagnostics::default();
+    let (path, mut diag, loader) =
+        i_slint_compiler::load_root_file(&path, version, &path, source, diag, compiler_config)
+            .await;
     if diag.has_error() {
-        return (Err(()), diag);
-    }
-    let (doc, mut diag) = compile_syntax_node(syntax_node, diag, compiler_config).await;
-    if diag.has_error() {
-        return (Err(()), diag);
-    }
-    if matches!(
-        doc.root_component.root_element.borrow().base_type,
-        ElementType::Global | ElementType::Error
-    ) {
-        diag.push_error_with_span("No component found".into(), Default::default());
         return (Err(()), diag);
     }
 
-    (Ok(generate_item_tree(&doc.root_component, guard)), diag)
+    let item_tree = {
+        #[allow(unused_mut)]
+        let mut it = {
+            let doc = loader.get_document(&path).unwrap();
+            if matches!(
+                doc.root_component.root_element.borrow().base_type,
+                ElementType::Global | ElementType::Error
+            ) {
+                diag.push_error_with_span("No component found".into(), Default::default());
+                return (Err(()), diag);
+            }
+
+            generate_item_tree(&doc.root_component, guard)
+        };
+
+        #[cfg(feature = "highlight")]
+        {
+            let _ = it.type_loader.set(Rc::new(loader));
+        }
+        it
+    };
+
+    (Ok(item_tree), diag)
 }
 
 pub(crate) fn generate_item_tree<'id>(
@@ -1167,6 +1186,8 @@ pub(crate) fn generate_item_tree<'id>(
         public_properties,
         compiled_globals,
         exported_globals_by_name,
+        #[cfg(feature = "highlight")]
+        type_loader: std::cell::OnceCell::new(),
     };
 
     Rc::new(t)

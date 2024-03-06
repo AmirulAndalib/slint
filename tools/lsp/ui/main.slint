@@ -24,8 +24,9 @@ export component PreviewUi inherits Window {
     out property <bool> design-mode;
 
     pure callback can-drop(/* component_type */ string, /* x */ length, /* y */ length) -> bool;
-    callback drop(/* component_type */ string, /* import_path */ string, /* is_layout */ bool, /* x */ length, /* y */ length);
+    callback drop(/* component_type */ string, /* x */ length, /* y */ length);
     callback selected-element-update-geometry(/* x */ length, /* y */ length, /* width */ length, /* height */ length);
+    callback selected-element-delete();
     callback select-at(/* x */ length, /* y */ length, /* enter_component? */ bool);
     callback select-behind(/* x */ length, /* y */ length, /* enter_component* */ bool, /* reverse */ bool);
     callback show-document(/* url */ string, /* line */ int, /* column */ int);
@@ -62,9 +63,12 @@ export component PreviewUi inherits Window {
                 height: self.preferred-height;
 
                 i-pick-button := Button {
-                    text: root.experimental ? @tr("Design Mode") : @tr("Pick Mode");
+                    text: @tr("Design Mode");
                     checkable: true;
                     checked <=> root.design-mode;
+                    clicked() => {
+                        key-handler.focus();
+                    }
                 }
 
                 Text {
@@ -86,7 +90,7 @@ export component PreviewUi inherits Window {
             }
 
             HorizontalLayout {
-                if (root.experimental): left-sidebar := Rectangle {
+                left-sidebar := Rectangle {
                     VerticalBox {
                         ComponentList {
                             known-components <=> root.known-components;
@@ -95,8 +99,8 @@ export component PreviewUi inherits Window {
                             preview-area-width: draw-area.preview-area-width;
                             preview-area-height: draw-area.preview-area-height;
 
-                            can-drop(ct, x, y) => { return root.can-drop(ct, x, y); }
-                            drop(ct, ip, il, x, y) => { root.drop(ct, ip, il, x, y); }
+                            can-drop(c, x, y) => { return root.can-drop(c, x, y); }
+                            drop(c, x, y) => { root.drop(c, x, y); }
                         }
                     }
 
@@ -115,10 +119,10 @@ export component PreviewUi inherits Window {
                     diagnostics <=> root.diagnostics;
                     preview-area <=> root.preview-area;
                     selections <=> root.selections;
-                    experimental <=> root.experimental;
 
                     select-at(x, y, enter_component) => { root.select-at(x, y, enter_component); }
                     selected-element-update-geometry(x, y, w, h) => { root.selected-element-update-geometry(x, y, w, h); }
+                    selected-element-delete() => { root.selected-element-delete(); }
                     select-behind(x, y, stay_in_file, reverse) => { root.select-behind(x, y, stay_in_file, reverse); }
                     show-document(url, line, column) => { root.show-document(url, line, column); }
                     unselect() => { root.unselect(); }
@@ -127,6 +131,18 @@ export component PreviewUi inherits Window {
 
                 preferred-width: draw-area.preferred-width + root.side-bar-width /* for left-side-bar */;
             }
+        }
+    }
+
+    key-handler := FocusScope {
+        enabled: root.design-mode;
+
+        key-released(event) => {
+            if event.text == Key.Delete {
+                root.selected-element-delete();
+                return accept;
+            }
+            reject
         }
     }
 }

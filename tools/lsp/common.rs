@@ -3,10 +3,8 @@
 
 //! Data structures common between LSP and previewer
 
-use i_slint_compiler::{
-    diagnostics::{SourceFile, SourceFileVersion},
-    parser::{syntax_nodes::Element, SyntaxKind},
-};
+use i_slint_compiler::diagnostics::{SourceFile, SourceFileVersion};
+use i_slint_compiler::object_tree::ElementRc;
 use lsp_types::{TextEdit, Url, WorkspaceEdit};
 
 use std::{collections::HashMap, path::PathBuf};
@@ -18,18 +16,57 @@ pub type UrlVersion = Option<i32>;
 #[cfg(target_arch = "wasm32")]
 use crate::wasm_prelude::*;
 
-/// Use this in nodes you want the language server and preview to
-/// ignore a node for code analysis purposes.
-pub const NODE_IGNORE_COMMENT: &str = "@lsp:ignore-node";
+#[derive(Clone)]
+pub struct ElementRcNode {
+    pub element: ElementRc,
+    pub debug_index: usize,
+}
 
-/// Check whether a node is marked to be ignored in the LSP/live preview
-/// using a comment containing `@lsp:ignore-node`
-pub fn is_element_node_ignored(node: &Element) -> bool {
-    node.children_with_tokens().any(|nt| {
-        nt.as_token()
-            .map(|t| t.kind() == SyntaxKind::Comment && t.text().contains(NODE_IGNORE_COMMENT))
-            .unwrap_or(false)
-    })
+impl std::fmt::Debug for ElementRcNode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (path, offset) = self.path_and_offset();
+        write!(f, "ElementNode {{ {path:?}:{offset} }}")
+    }
+}
+
+impl ElementRcNode {
+    pub fn find_in(element: ElementRc, path: &std::path::Path, offset: u32) -> Option<Self> {
+        let debug_index = element.borrow().debug.iter().position(|(n, _)| {
+            u32::from(n.text_range().start()) == offset && n.source_file.path() == path
+        })?;
+
+        Some(Self { element, debug_index })
+    }
+
+    pub fn with_element_debug<R>(
+        &self,
+        func: impl Fn(
+            &i_slint_compiler::parser::syntax_nodes::Element,
+            &Option<i_slint_compiler::layout::Layout>,
+        ) -> R,
+    ) -> R {
+        let elem = self.element.borrow();
+        let (n, l) = &elem.debug.get(self.debug_index).unwrap();
+        func(n, l)
+    }
+
+    pub fn with_element_node<R>(
+        &self,
+        func: impl Fn(&i_slint_compiler::parser::syntax_nodes::Element) -> R,
+    ) -> R {
+        let elem = self.element.borrow();
+        func(&elem.debug.get(self.debug_index).unwrap().0)
+    }
+
+    pub fn path_and_offset(&self) -> (PathBuf, u32) {
+        self.with_element_node(|n| {
+            (n.source_file.path().to_owned(), u32::from(n.text_range().start()))
+        })
+    }
+
+    pub fn is_layout(&self) -> bool {
+        self.with_element_debug(|_, l| l.is_some())
+    }
 }
 
 pub fn create_workspace_edit(
@@ -108,6 +145,7 @@ pub struct VersionedPosition {
     offset: u32,
 }
 
+#[allow(unused)]
 impl VersionedPosition {
     pub fn new(url: VersionedUrl, offset: u32) -> Self {
         VersionedPosition { url, offset }
@@ -151,29 +189,11 @@ pub struct PreviewComponent {
 #[allow(unused)]
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 pub enum LspToPreviewMessage {
-    SetContents {
-        url: VersionedUrl,
-        contents: String,
-    },
-    /// Adjust any selection in the document with `url` that is at or behind `offset` by `delta`
-    AdjustSelection {
-        url: VersionedUrl,
-        start_offset: u32,
-        end_offset: u32,
-        new_length: u32,
-    },
-    SetConfiguration {
-        config: PreviewConfig,
-    },
+    SetContents { url: VersionedUrl, contents: String },
+    SetConfiguration { config: PreviewConfig },
     ShowPreview(PreviewComponent),
-    HighlightFromEditor {
-        url: Option<Url>,
-        offset: u32,
-    },
-    KnownComponents {
-        url: Option<VersionedUrl>,
-        components: Vec<ComponentInformation>,
-    },
+    HighlightFromEditor { url: Option<Url>, offset: u32 },
+    KnownComponents { url: Option<VersionedUrl>, components: Vec<ComponentInformation> },
 }
 
 #[allow(unused)]
@@ -187,22 +207,14 @@ pub struct Diagnostic {
 }
 
 #[allow(unused)]
-#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
-pub struct ComponentAddition {
-    pub component_type: String,
-    pub import_path: Option<String>, // Url fails to convert reliably:-/
-    pub insert_position: VersionedPosition,
-    pub component_text: String,
-}
-
-#[allow(unused)]
-#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Eq, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct PropertyChange {
     pub name: String,
     pub value: String,
 }
 
 impl PropertyChange {
+    #[allow(unused)]
     pub fn new(name: &str, value: String) -> Self {
         PropertyChange { name: name.to_string(), value }
     }
@@ -211,13 +223,26 @@ impl PropertyChange {
 #[allow(unused)]
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 pub enum PreviewToLspMessage {
+    /// Show a status message in the editor
     Status { message: String, health: crate::lsp_ext::Health },
+    /// Report diagnostics to editor.
     Diagnostics { uri: Url, diagnostics: Vec<lsp_types::Diagnostic> },
+    /// Show a document in the editor.
     ShowDocument { file: Url, selection: lsp_types::Range },
+    /// Switch between native and WASM preview (if supported)
     PreviewTypeChanged { is_external: bool },
-    RequestState { unused: bool }, // send all documents!
-    AddComponent { label: Option<String>, component: ComponentAddition },
-    UpdateElement { position: VersionedPosition, properties: Vec<PropertyChange> },
+    /// Request all documents and configuration to be sent from the LSP to the
+    /// Preview.
+    RequestState { unused: bool },
+    /// Update properties on an element at `position`
+    /// The LSP side needs to look at properties: It sees way more of them!
+    UpdateElement {
+        label: Option<String>,
+        position: VersionedPosition,
+        properties: Vec<PropertyChange>,
+    },
+    /// Pass a `WorkspaceEdit` on to the editor
+    SendWorkspaceEdit { label: Option<String>, edit: lsp_types::WorkspaceEdit },
 }
 
 /// Information on the Element types available
@@ -237,8 +262,12 @@ pub struct ComponentInformation {
     pub is_exported: bool,
     /// This is a layout
     pub is_layout: bool,
+    /// This element fills its parent
+    pub fills_parent: bool,
     /// The URL to the file containing this type
     pub defined_at: Option<Position>,
+    /// Default property values
+    pub default_properties: Vec<PropertyChange>,
 }
 
 impl ComponentInformation {
@@ -256,6 +285,7 @@ impl ComponentInformation {
     }
 }
 
+#[cfg(any(feature = "preview-external", feature = "preview-engine"))]
 pub mod lsp_to_editor {
     use lsp_types::notification::Notification;
 
@@ -305,7 +335,6 @@ pub mod lsp_to_editor {
         })
     }
 
-    #[cfg(feature = "preview-engine")]
     pub async fn send_show_document_to_editor(
         sender: crate::ServerNotifier,
         file: lsp_types::Url,

@@ -138,7 +138,7 @@ pub(crate) fn completion_at(
     } else if let Some(n) = syntax_nodes::Binding::new(node.clone()) {
         if let Some(colon) = n.child_token(SyntaxKind::Colon) {
             if offset >= colon.text_range().end().into() {
-                return with_lookup_ctx(document_cache, node, |ctx| {
+                return with_lookup_ctx(&document_cache.documents, node, |ctx| {
                     resolve_expression_scope(ctx).map(Into::into)
                 })?;
             }
@@ -153,20 +153,26 @@ pub(crate) fn completion_at(
                 .collect::<Vec<_>>(),
         );
     } else if let Some(n) = syntax_nodes::TwoWayBinding::new(node.clone()) {
-        if token.kind() != SyntaxKind::Identifier {
+        let double_arrow_range =
+            n.children_with_tokens().find(|n| n.kind() == SyntaxKind::DoubleArrow)?.text_range();
+        if offset < double_arrow_range.end().into() {
             return None;
         }
-        let all = resolve_element_scope(syntax_nodes::Element::new(n.parent()?)?, document_cache)?;
-        return Some(
-            all.into_iter()
-                .filter(|ce| ce.kind == Some(CompletionItemKind::PROPERTY))
-                .collect::<Vec<_>>(),
-        );
+        return with_lookup_ctx(&document_cache.documents, node, |ctx| {
+            resolve_expression_scope(ctx)
+        })?;
     } else if let Some(n) = syntax_nodes::CallbackConnection::new(node.clone()) {
         if token.kind() != SyntaxKind::Identifier {
             return None;
         }
-        let all = resolve_element_scope(syntax_nodes::Element::new(n.parent()?)?, document_cache)?;
+        let mut parent = n.parent()?;
+        let element = loop {
+            if let Some(e) = syntax_nodes::Element::new(parent.clone()) {
+                break e;
+            }
+            parent = parent.parent()?;
+        };
+        let all = resolve_element_scope(element, document_cache)?;
         return Some(
             all.into_iter()
                 .filter(|ce| ce.kind == Some(CompletionItemKind::METHOD))
@@ -225,7 +231,7 @@ pub(crate) fn completion_at(
             );
         }
 
-        return with_lookup_ctx(document_cache, node, |ctx| {
+        return with_lookup_ctx(&document_cache.documents, node, |ctx| {
             resolve_expression_scope(ctx).map(Into::into)
         })?;
     } else if let Some(q) = syntax_nodes::QualifiedName::new(node.clone()) {
@@ -267,7 +273,7 @@ pub(crate) fn completion_at(
                 return resolve_type_scope(token, document_cache).map(Into::into);
             }
             SyntaxKind::Expression => {
-                return with_lookup_ctx(document_cache, node, |ctx| {
+                return with_lookup_ctx(&document_cache.documents, node, |ctx| {
                     let it = q.children_with_tokens().filter_map(|t| t.into_token());
                     let mut it = it.skip_while(|t| {
                         t.kind() != SyntaxKind::Identifier && t.token != token.token
@@ -325,7 +331,7 @@ pub(crate) fn completion_at(
                 .collect(),
         );
     } else if node.kind() == SyntaxKind::Document {
-        let r: Vec<_> = [
+        let mut r: Vec<_> = [
             // the $1 is first in the quote so the filename can be completed before the import names
             ("import", "import { ${2:Component} } from \"${1:std-widgets.slint}\";"),
             ("component", "component ${1:Component} {\n    $0\n}"),
@@ -343,7 +349,33 @@ pub(crate) fn completion_at(
             with_insert_text(c, ins_tex, snippet_support)
         })
         .collect();
+        if let Some(component) = token
+            .prev_sibling_or_token()
+            .filter(|x| x.kind() == SyntaxKind::Component)
+            .and_then(|x| x.into_node())
+        {
+            let has_child = |kind| {
+                !component.children().find(|n| n.kind() == kind).unwrap().text_range().is_empty()
+            };
+            if has_child(SyntaxKind::DeclaredIdentifier) && !has_child(SyntaxKind::Element) {
+                let mut c = CompletionItem::new_simple("inherits".into(), String::new());
+                c.kind = Some(CompletionItemKind::KEYWORD);
+                r.push(c)
+            }
+        }
         return Some(r);
+    } else if let Some(c) = syntax_nodes::Component::new(node.clone()) {
+        let id_range = c.DeclaredIdentifier().text_range();
+        if !id_range.is_empty()
+            && offset >= id_range.end().into()
+            && !c
+                .children_with_tokens()
+                .any(|c| c.as_token().map_or(false, |t| t.text() == "inherits"))
+        {
+            let mut c = CompletionItem::new_simple("inherits".into(), String::new());
+            c.kind = Some(CompletionItemKind::KEYWORD);
+            return Some(vec![c]);
+        }
     } else if node.kind() == SyntaxKind::State {
         let r: Vec<_> = [("when", "when $1: {\n    $0\n}")]
             .iter()
@@ -418,6 +450,7 @@ fn resolve_element_scope(
                 pr.Type().map(|t| t.text().into()).unwrap_or_else(|| "property".to_owned()),
             );
             c.kind = Some(CompletionItemKind::PROPERTY);
+            c.sort_text = Some(format!("#{}", c.label));
             Some(c)
         }))
         .chain(element.CallbackDeclaration().filter_map(|cd| {
@@ -426,6 +459,7 @@ fn resolve_element_scope(
                 "callback".into(),
             );
             c.kind = Some(CompletionItemKind::METHOD);
+            c.sort_text = Some(format!("#{}", c.label));
             Some(c)
         }))
         .collect::<Vec<_>>();
@@ -715,6 +749,7 @@ fn create_import_edit_impl(
 }
 
 /// Creates a text edit
+#[cfg(any(feature = "preview-external", feature = "preview-engine"))]
 pub fn create_import_edit(
     document: &i_slint_compiler::object_tree::Document,
     component: &str,
@@ -1158,5 +1193,62 @@ mod tests {
         assert_eq!(edit.range.end.line, 1);
         assert_eq!(edit.range.end.character, 32);
         assert_eq!(edit.new_text, ", AboutSlint");
+    }
+
+    #[test]
+    fn inherits() {
+        let sources = [
+            "component Bar 🔺",
+            "component Bar in🔺",
+            "component Bar 🔺 {}",
+            "component Bar in🔺 Window {}",
+        ];
+        for source in sources {
+            eprintln!("Test for inherits in {source:?}");
+            let res = get_completions(source).unwrap();
+            res.iter().find(|ci| ci.label == "inherits").unwrap();
+        }
+
+        let sources = ["component 🔺", "component Bar {}🔺", "component Bar inherits 🔺 {}", "🔺"];
+        for source in sources {
+            let Some(res) = get_completions(source) else { continue };
+            assert!(
+                res.iter().find(|ci| ci.label == "inherits").is_none(),
+                "completion for {source:?} contains 'inherits'"
+            );
+        }
+    }
+
+    #[test]
+    fn two_way_bindings() {
+        let sources = [
+            "component X { property<string> prop; elem := Text{} property foo <=> 🔺",
+            "component X { property<string> prop; elem := Text{} property<string> foo <=> e🔺; }",
+            "component X { property<string> prop; elem := Text{} prop <=> 🔺",
+            "component X { property<string> prop; elem := Text{} prop <=> e🔺; }",
+        ];
+        for source in sources {
+            eprintln!("Test for two ways in {source:?}");
+            let res = get_completions(source).unwrap();
+            res.iter().find(|ci| ci.label == "prop").unwrap();
+            res.iter().find(|ci| ci.label == "self").unwrap();
+            res.iter().find(|ci| ci.label == "root").unwrap();
+            res.iter().find(|ci| ci.label == "elem").unwrap();
+        }
+
+        let sources = [
+            "component X { elem := Text{ property<int> prop; } property foo <=> elem.🔺",
+            "component X { elem := Text{ property<int> prop; } property <string> foo <=> elem.t🔺",
+            "component X { elem := Text{ property<int> prop; } property foo <=> elem.🔺; }",
+            "component X { elem := Text{ property<string> prop; } title <=> elem.t🔺",
+            "component X { elem := Text{ property<string> prop; } title <=> elem.🔺; }",
+        ];
+        for source in sources {
+            eprintln!("Test for two ways in {source:?}");
+            let res = get_completions(source).unwrap();
+            res.iter().find(|ci| ci.label == "text").unwrap();
+            res.iter().find(|ci| ci.label == "prop").unwrap();
+            assert!(res.iter().find(|ci| ci.label == "elem").is_none());
+        }
     }
 }

@@ -29,7 +29,11 @@ pub fn collect_test_cases() -> std::io::Result<Vec<test_driver_lib::TestCase>> {
         }
         if let Some(ext) = absolute_path.extension() {
             if ext == "60" || ext == "slint" {
-                results.push(test_driver_lib::TestCase { absolute_path, relative_path });
+                results.push(test_driver_lib::TestCase {
+                    absolute_path,
+                    relative_path,
+                    requested_style: None,
+                });
             }
         }
     }
@@ -154,7 +158,7 @@ fn generate_source(
     compiler_config.embed_resources = EmbedResourcesKind::EmbedTextures;
     compiler_config.enable_component_containers = true;
     compiler_config.style = Some("fluent".to_string());
-    let (root_component, diag) =
+    let (root_component, diag, _) =
         spin_on::spin_on(compile_syntax_node(syntax_node, diag, compiler_config));
 
     if diag.has_error() {

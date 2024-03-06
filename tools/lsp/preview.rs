@@ -1,14 +1,12 @@
 // Copyright © SixtyFPS GmbH <info@slint.dev>
 // SPDX-License-Identifier: GPL-3.0-only OR LicenseRef-Slint-Royalty-free-1.1 OR LicenseRef-Slint-commercial
 
-use crate::common::{
-    ComponentInformation, PreviewComponent, PreviewConfig, UrlVersion, VersionedPosition,
-    VersionedUrl,
-};
+use crate::common::{self, ComponentInformation, PreviewComponent, PreviewConfig};
 use crate::lsp_ext::Health;
 use crate::preview::element_selection::ElementSelection;
-use crate::util::map_position;
+use crate::util;
 use i_slint_compiler::object_tree::ElementRc;
+use i_slint_compiler::parser::{syntax_nodes::Element, SyntaxKind};
 use i_slint_core::component_factory::FactoryContext;
 use i_slint_core::lengths::{LogicalLength, LogicalPoint};
 use i_slint_core::model::VecModel;
@@ -52,7 +50,7 @@ enum PreviewFutureState {
 
 #[derive(Default)]
 struct ContentCache {
-    source_code: HashMap<Url, (UrlVersion, String)>,
+    source_code: HashMap<Url, (common::UrlVersion, String)>,
     dependency: HashSet<Url>,
     current: Option<PreviewComponent>,
     config: PreviewConfig,
@@ -69,10 +67,11 @@ struct PreviewState {
     handle: Rc<RefCell<Option<slint_interpreter::ComponentInstance>>>,
     selected: Option<element_selection::ElementSelection>,
     notify_editor_about_selection_after_update: bool,
+    known_components: Vec<ComponentInformation>,
 }
 thread_local! {static PREVIEW_STATE: std::cell::RefCell<PreviewState> = Default::default();}
 
-pub fn set_contents(url: &VersionedUrl, content: String) {
+pub fn set_contents(url: &common::VersionedUrl, content: String) {
     let mut cache = CONTENT_CACHE.get_or_init(Default::default).lock().unwrap();
     let old = cache.source_code.insert(url.url().clone(), (url.version().clone(), content.clone()));
     if cache.dependency.contains(url.url()) {
@@ -109,50 +108,102 @@ fn search_for_parent_element(root: &ElementRc, child: &ElementRc) -> Option<Elem
 }
 
 // triggered from the UI, running in UI thread
-fn can_drop_component(_component_name: slint::SharedString, x: f32, y: f32) -> bool {
-    drop_location::can_drop_at(x, y)
+fn can_drop_component(component_type: slint::SharedString, x: f32, y: f32) -> bool {
+    let component_type = component_type.to_string();
+
+    PREVIEW_STATE.with(move |preview_state| {
+        let preview_state = preview_state.borrow();
+
+        let component_index = &preview_state
+            .known_components
+            .binary_search_by_key(&component_type.as_str(), |ci| ci.name.as_str())
+            .unwrap_or(usize::MAX);
+
+        let Some(component) = preview_state.known_components.get(*component_index) else {
+            return false;
+        };
+
+        drop_location::can_drop_at(x, y, component)
+    })
 }
 
 // triggered from the UI, running in UI thread
-fn drop_component(
-    component_name: slint::SharedString,
-    import_path: slint::SharedString,
-    is_layout: bool,
-    x: f32,
-    y: f32,
-) {
-    if let Some((component, selection_offset)) =
-        drop_location::drop_at(x, y, component_name.to_string(), import_path.to_string())
-    {
-        let path = Url::to_file_path(component.insert_position.url()).ok().unwrap_or_default();
+fn drop_component(component_type: slint::SharedString, x: f32, y: f32) {
+    let component_type = component_type.to_string();
+
+    let drop_result = PREVIEW_STATE.with(|preview_state| {
+        let preview_state = preview_state.borrow();
+
+        let component_index = &preview_state
+            .known_components
+            .binary_search_by_key(&component_type.as_str(), |ci| ci.name.as_str())
+            .unwrap_or(usize::MAX);
+
+        drop_location::drop_at(x, y, preview_state.known_components.get(*component_index)?)
+    });
+
+    if let Some((edit, drop_data)) = drop_result {
         element_selection::select_element_at_source_code_position(
-            path,
-            selection_offset,
-            is_layout,
+            drop_data.path,
+            drop_data.selection_offset,
+            drop_data.is_layout,
             None,
             true,
         );
 
-        send_message_to_lsp(crate::common::PreviewToLspMessage::AddComponent {
-            label: Some(format!("Dropped {}", component_name.as_str())),
-            component,
+        send_message_to_lsp(crate::common::PreviewToLspMessage::SendWorkspaceEdit {
+            label: Some(format!("Add element {}", component_type)),
+            edit,
         });
     };
 }
 
 // triggered from the UI, running in UI thread
-fn change_geometry_of_selected_element(x: f32, y: f32, width: f32, height: f32) {
-    let Some(selected) = PREVIEW_STATE.with(move |preview_state| {
-        let preview_state = preview_state.borrow();
-        preview_state.selected.clone()
+fn delete_selected_element() {
+    let Some(selected) = selected_element() else {
+        return;
+    };
+
+    let Ok(url) = Url::from_file_path(&selected.path) else {
+        return;
+    };
+
+    let cache = CONTENT_CACHE.get_or_init(Default::default).lock().unwrap();
+    let Some((version, _)) = cache.source_code.get(&url).cloned() else {
+        return;
+    };
+
+    let Some(range) = selected.as_element_node().and_then(|en| {
+        en.with_element_node(|n| {
+            if let Some(parent) = &n.parent() {
+                if parent.kind() == SyntaxKind::SubElement {
+                    return util::map_node(parent);
+                }
+            }
+            util::map_node(n)
+        })
     }) else {
         return;
     };
 
-    let Some(selected_element_struct) = selected_element() else {
+    let edit = common::create_workspace_edit(
+        url,
+        version,
+        vec![lsp_types::TextEdit { range, new_text: "".into() }],
+    );
+
+    send_message_to_lsp(crate::common::PreviewToLspMessage::SendWorkspaceEdit {
+        label: Some("Delete element".to_string()),
+        edit,
+    });
+}
+
+// triggered from the UI, running in UI thread
+fn change_geometry_of_selected_element(x: f32, y: f32, width: f32, height: f32) {
+    let Some(selected) = selected_element() else {
         return;
     };
-    let Some(selected_element) = selected_element_struct.as_element() else {
+    let Some(selected_element_node) = selected.as_element_node() else {
         return;
     };
     let Some(component_instance) = component_instance() else {
@@ -160,7 +211,7 @@ fn change_geometry_of_selected_element(x: f32, y: f32, width: f32, height: f32) 
     };
 
     let Some(geometry) = component_instance
-        .element_position(&selected_element)
+        .element_position(&selected_element_node.element)
         .get(selected.instance_index)
         .cloned()
     else {
@@ -170,37 +221,43 @@ fn change_geometry_of_selected_element(x: f32, y: f32, width: f32, height: f32) 
     let click_position = LogicalPoint::from_lengths(LogicalLength::new(x), LogicalLength::new(y));
     let root_element = element_selection::root_element(&component_instance);
 
-    let (parent_x, parent_y) = search_for_parent_element(&root_element, &selected_element)
-        .and_then(|parent_element| {
-            component_instance
-                .element_position(&parent_element)
-                .iter()
-                .find(|g| g.contains(click_position))
-                .map(|g| (g.origin.x, g.origin.y))
-        })
-        .unwrap_or_default();
+    let (parent_x, parent_y) =
+        search_for_parent_element(&root_element, &selected_element_node.element)
+            .and_then(|parent_element| {
+                component_instance
+                    .element_position(&parent_element)
+                    .iter()
+                    .find(|g| g.contains(click_position))
+                    .map(|g| (g.origin.x, g.origin.y))
+            })
+            .unwrap_or_default();
 
-    let properties = {
+    let (properties, op) = {
         let mut p = Vec::with_capacity(4);
+        let mut op = "";
         if geometry.origin.x != x {
             p.push(crate::common::PropertyChange::new(
                 "x",
                 format!("{}px", (x - parent_x).round()),
             ));
+            op = "Moving";
         }
         if geometry.origin.y != y {
             p.push(crate::common::PropertyChange::new(
                 "y",
                 format!("{}px", (y - parent_y).round()),
             ));
+            op = "Moving";
         }
         if geometry.size.width != width {
             p.push(crate::common::PropertyChange::new("width", format!("{}px", width.round())));
+            op = "Resizing";
         }
         if geometry.size.height != height {
             p.push(crate::common::PropertyChange::new("height", format!("{}px", height.round())));
+            op = "Resizing";
         }
-        p
+        (p, op)
     };
 
     if !properties.is_empty() {
@@ -214,7 +271,11 @@ fn change_geometry_of_selected_element(x: f32, y: f32, width: f32, height: f32) 
         };
 
         send_message_to_lsp(crate::common::PreviewToLspMessage::UpdateElement {
-            position: VersionedPosition::new(VersionedUrl::new(url, version), selected.offset),
+            label: Some(format!("{op} element")),
+            position: common::VersionedPosition::new(
+                common::VersionedUrl::new(url, version),
+                selected.offset,
+            ),
             properties,
         });
     }
@@ -271,59 +332,16 @@ pub fn config_changed(config: PreviewConfig) {
     };
 }
 
-pub fn adjust_selection(url: VersionedUrl, start_offset: u32, end_offset: u32, new_length: u32) {
-    let Some((version, _)) = get_url_from_cache(url.url()) else {
-        return;
-    };
-
-    run_in_ui_thread(move || async move {
-        if &version != url.version() {
-            // We are outdated anyway, no use updating now.
-            return;
-        };
-
-        let Ok(path) = Url::to_file_path(url.url()) else {
-            return;
-        };
-
-        let Some(selected) = PREVIEW_STATE.with(move |preview_state| {
-            let preview_state = preview_state.borrow();
-
-            preview_state.selected.clone()
-        }) else {
-            return;
-        };
-
-        if selected.path != path {
-            // Not relevant for the current selection
-            return;
-        }
-        if selected.offset < start_offset {
-            // Nothing to do!
-        } else if selected.offset >= start_offset {
-            // Worst case if we get the offset wrong:
-            // Some other nearby element ends up getting marked as selected.
-            // So ignore special cases :-)
-            let old_length = end_offset - start_offset;
-            let offset = selected.offset + new_length - old_length;
-            PREVIEW_STATE.with(move |preview_state| {
-                let mut preview_state = preview_state.borrow_mut();
-                preview_state.selected = Some(ElementSelection { offset, ..selected });
-            });
-        }
-    })
-}
-
 /// If the file is in the cache, returns it.
 /// In any way, register it as a dependency
-fn get_url_from_cache(url: &Url) -> Option<(UrlVersion, String)> {
+fn get_url_from_cache(url: &Url) -> Option<(common::UrlVersion, String)> {
     let mut cache = CONTENT_CACHE.get_or_init(Default::default).lock().unwrap();
     let r = cache.source_code.get(url).cloned();
     cache.dependency.insert(url.to_owned());
     r
 }
 
-fn get_path_from_cache(path: &Path) -> Option<(UrlVersion, String)> {
+fn get_path_from_cache(path: &Path) -> Option<(common::UrlVersion, String)> {
     let url = Url::from_file_path(path).ok()?;
     get_url_from_cache(&url)
 }
@@ -410,14 +428,11 @@ pub fn load_preview(preview_component: PreviewComponent) {
                         .element_at_source_code_position(&se.path, se.offset)
                         .first()
                     {
-                        if let Some((node, _)) = element
-                            .borrow()
-                            .debug
-                            .iter()
-                            .find(|n| !crate::common::is_element_node_ignored(&n.0))
+                        if let Some((node, _)) =
+                            element.borrow().debug.iter().find(|n| !is_element_node_ignored(&n.0))
                         {
                             let sf = &node.source_file;
-                            let pos = map_position(sf, se.offset.into());
+                            let pos = util::map_position(sf, se.offset.into());
                             ask_editor_to_show_document(
                                 &se.path.to_string_lossy(),
                                 lsp_types::Range::new(pos.clone(), pos),
@@ -465,8 +480,7 @@ async fn reload_preview_impl(
     let compiled = if let Some((_, mut from_cache)) = get_url_from_cache(&component.url) {
         if let Some(component_name) = &component.component {
             from_cache = format!(
-                "{from_cache}\nexport component _SLINT_LivePreview inherits {component_name} {{ /* {} */ }}\n",
-                crate::common::NODE_IGNORE_COMMENT,
+                "{from_cache}\nexport component _SLINT_LivePreview inherits {component_name} {{ /* {NODE_IGNORE_COMMENT} */ }}\n",
             );
         }
         builder.build_from_source(from_cache, path).await
@@ -531,14 +545,13 @@ pub fn highlight(url: Option<Url>, offset: u32) {
             };
             let elements = component_instance.element_at_source_code_position(&path, offset);
             if let Some(e) = elements.first() {
-                let is_layout = e
-                    .borrow()
-                    .debug
-                    .iter()
-                    .find(|(node, _)| {
-                        node.text_range().contains(offset.into()) && node.source_file.path() == path
-                    })
-                    .map_or(false, |d| d.1.is_some());
+                let Some(debug_index) = e.borrow().debug.iter().position(|(n, _)| {
+                    n.text_range().contains(offset.into()) && n.source_file.path() == path
+                }) else {
+                    return;
+                };
+                let is_layout =
+                    e.borrow().debug.get(debug_index).map_or(false, |(_, l)| l.is_some());
                 element_selection::select_element_at_source_code_position(
                     path, offset, is_layout, None, false,
                 );
@@ -549,17 +562,19 @@ pub fn highlight(url: Option<Url>, offset: u32) {
     }
 }
 
-/// Highlight the element pointed at the offset in the path.
-/// When path is None, remove the highlight.
-pub fn known_components(_url: &Option<VersionedUrl>, components: Vec<ComponentInformation>) {
-    let cache = CONTENT_CACHE.get_or_init(Default::default).lock().unwrap();
-    let current_url = cache.current.as_ref().map(|pc| pc.url.clone());
+pub fn known_components(
+    _url: &Option<common::VersionedUrl>,
+    mut components: Vec<ComponentInformation>,
+) {
+    components.sort_unstable_by_key(|ci| ci.name.clone());
 
     run_in_ui_thread(move || async move {
         PREVIEW_STATE.with(|preview_state| {
-            let preview_state = preview_state.borrow();
+            let mut preview_state = preview_state.borrow_mut();
+            preview_state.known_components = components;
+
             if let Some(ui) = &preview_state.ui {
-                ui::ui_set_known_components(ui, &current_url, &components)
+                ui::ui_set_known_components(ui, &preview_state.known_components)
             }
         })
     });
@@ -590,6 +605,8 @@ fn set_selections(
     ui: Option<&ui::PreviewUi>,
     main_index: usize,
     is_layout: bool,
+    is_moveable: bool,
+    is_resizable: bool,
     positions: ComponentPositions,
 ) {
     let Some(ui) = ui else {
@@ -618,6 +635,8 @@ fn set_selections(
             y: g.origin.y,
             border_color: if i == main_index { border_color } else { secondary_border_color },
             is_primary: i == main_index,
+            is_moveable,
+            is_resizable,
         })
         .collect::<Vec<_>>();
     let model = Rc::new(slint::VecModel::from(values));
@@ -629,13 +648,21 @@ fn set_selected_element(
     positions: slint_interpreter::highlight::ComponentPositions,
     notify_editor_about_selection_after_update: bool,
 ) {
+    let (is_layout, is_in_layout) = selection
+        .as_ref()
+        .and_then(|s| s.as_element_node())
+        .map(|en| (en.is_layout(), element_selection::is_element_node_in_layout(&en)))
+        .unwrap_or((false, false));
+
     PREVIEW_STATE.with(move |preview_state| {
         let mut preview_state = preview_state.borrow_mut();
 
         set_selections(
             preview_state.ui.as_ref(),
             selection.as_ref().map(|s| s.instance_index).unwrap_or_default(),
-            selection.as_ref().map(|s| s.is_layout).unwrap_or_default(),
+            is_layout,
+            !is_in_layout && !is_layout,
+            !is_in_layout && !is_layout,
             positions,
         );
 
@@ -757,9 +784,6 @@ pub fn lsp_to_preview_message(
         M::SetConfiguration { config } => {
             config_changed(config);
         }
-        M::AdjustSelection { url, start_offset, end_offset, new_length } => {
-            adjust_selection(url, start_offset, end_offset, new_length);
-        }
         M::ShowPreview(pc) => {
             #[cfg(not(target_arch = "wasm32"))]
             native::open_ui(sender);
@@ -772,4 +796,18 @@ pub fn lsp_to_preview_message(
             known_components(&url, components);
         }
     }
+}
+
+/// Use this in nodes you want the language server and preview to
+/// ignore a node for code analysis purposes.
+const NODE_IGNORE_COMMENT: &str = "@lsp:ignore-node";
+
+/// Check whether a node is marked to be ignored in the LSP/live preview
+/// using a comment containing `@lsp:ignore-node`
+fn is_element_node_ignored(node: &Element) -> bool {
+    node.children_with_tokens().any(|nt| {
+        nt.as_token()
+            .map(|t| t.kind() == SyntaxKind::Comment && t.text().contains(NODE_IGNORE_COMMENT))
+            .unwrap_or(false)
+    })
 }

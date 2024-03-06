@@ -10,7 +10,7 @@ use crate::slice::Slice;
 use crate::{SharedString, SharedVector};
 
 use super::{IntRect, IntSize};
-use crate::items::{ImageFit, ImageHorizontalAlignment, ImageVerticalAlignment};
+use crate::items::{ImageFit, ImageHorizontalAlignment, ImageTiling, ImageVerticalAlignment};
 
 #[cfg(feature = "image-decoders")]
 pub mod cache;
@@ -881,73 +881,175 @@ pub struct FitResult {
     pub size: euclid::Size2D<f32, PhysicalPx>,
     /// The offset in the target in which we draw the image
     pub offset: euclid::Point2D<f32, PhysicalPx>,
+    /// When Some, it means the image should be tiled instead of stretched to the target
+    /// but still scaled with the source_to_target_x and source_to_target_y factor
+    /// The point is the coordinate within the image's clip_rect of the pixel at the offset
+    pub tiled: Option<euclid::default::Point2D<u32>>,
 }
 
-/// Return an size that can be used to render an image in a buffer that matches a given ImageFit
+impl FitResult {
+    fn adjust_for_tiling(
+        self,
+        ratio: f32,
+        alignment: (ImageHorizontalAlignment, ImageVerticalAlignment),
+        tiling: (ImageTiling, ImageTiling),
+    ) -> Self {
+        let mut r = self;
+        let mut tiled = euclid::Point2D::default();
+        let target = r.size;
+        let o = r.clip_rect.size.cast::<f32>();
+        match tiling.0 {
+            ImageTiling::None => {
+                r.size.width = o.width * r.source_to_target_x;
+                if (o.width as f32) > target.width / r.source_to_target_x {
+                    let diff = (o.width as f32 - target.width / r.source_to_target_x) as i32;
+                    r.clip_rect.size.width -= diff;
+                    r.clip_rect.origin.x += match alignment.0 {
+                        ImageHorizontalAlignment::Center => diff / 2,
+                        ImageHorizontalAlignment::Left => 0,
+                        ImageHorizontalAlignment::Right => diff,
+                    };
+                    r.size.width = target.width;
+                } else if (o.width as f32) < target.width / r.source_to_target_x {
+                    r.offset.x += match alignment.0 {
+                        ImageHorizontalAlignment::Center => {
+                            (target.width - o.width as f32 * r.source_to_target_x) / 2.
+                        }
+                        ImageHorizontalAlignment::Left => 0.,
+                        ImageHorizontalAlignment::Right => {
+                            target.width - o.width as f32 * r.source_to_target_x
+                        }
+                    };
+                }
+            }
+            ImageTiling::Repeat => {
+                tiled.x = match alignment.0 {
+                    ImageHorizontalAlignment::Left => 0,
+                    ImageHorizontalAlignment::Center => {
+                        ((o.width - target.width / ratio) / 2.).rem_euclid(o.width) as u32
+                    }
+                    ImageHorizontalAlignment::Right => {
+                        (-target.width / ratio).rem_euclid(o.width) as u32
+                    }
+                };
+                r.source_to_target_x = ratio;
+            }
+            ImageTiling::Round => {
+                if target.width / ratio <= o.width * 1.5 {
+                    r.source_to_target_x = target.width / o.width;
+                } else {
+                    let mut rem = (target.width / ratio).rem_euclid(o.width);
+                    if rem > o.width / 2. {
+                        rem -= o.width;
+                    }
+                    r.source_to_target_x = ratio * target.width / (target.width - rem * ratio);
+                }
+            }
+        }
+
+        match tiling.1 {
+            ImageTiling::None => {
+                r.size.height = o.height * r.source_to_target_y;
+                if (o.height as f32) > target.height / r.source_to_target_y {
+                    let diff = (o.height as f32 - target.height / r.source_to_target_y) as i32;
+                    r.clip_rect.size.height -= diff;
+                    r.clip_rect.origin.y += match alignment.1 {
+                        ImageVerticalAlignment::Center => diff / 2,
+                        ImageVerticalAlignment::Top => 0,
+                        ImageVerticalAlignment::Bottom => diff,
+                    };
+                    r.size.height = target.height;
+                } else if (o.height as f32) < target.height / r.source_to_target_y {
+                    r.offset.y += match alignment.1 {
+                        ImageVerticalAlignment::Center => {
+                            (target.height - o.height as f32 * r.source_to_target_y) / 2.
+                        }
+                        ImageVerticalAlignment::Top => 0.,
+                        ImageVerticalAlignment::Bottom => {
+                            target.height - o.height as f32 * r.source_to_target_y
+                        }
+                    };
+                }
+            }
+            ImageTiling::Repeat => {
+                tiled.y = match alignment.1 {
+                    ImageVerticalAlignment::Top => 0,
+                    ImageVerticalAlignment::Center => {
+                        ((o.height - target.height / ratio) / 2.).rem_euclid(o.height) as u32
+                    }
+                    ImageVerticalAlignment::Bottom => {
+                        (-target.height / ratio).rem_euclid(o.height) as u32
+                    }
+                };
+                r.source_to_target_y = ratio;
+            }
+            ImageTiling::Round => {
+                if target.height / ratio <= o.height * 1.5 {
+                    r.source_to_target_y = target.height / o.height;
+                } else {
+                    let mut rem = (target.height / ratio).rem_euclid(o.height);
+                    if rem > o.height / 2. {
+                        rem -= o.height;
+                    }
+                    r.source_to_target_y = ratio * target.height / (target.height - rem * ratio);
+                }
+            }
+        }
+        let has_tiling = tiling != (ImageTiling::None, ImageTiling::None);
+        r.tiled = has_tiling.then_some(tiled);
+        r
+    }
+}
+
+#[cfg(not(feature = "std"))]
+trait RemEuclid {
+    fn rem_euclid(self, b: f32) -> f32;
+}
+#[cfg(not(feature = "std"))]
+impl RemEuclid for f32 {
+    fn rem_euclid(self, b: f32) -> f32 {
+        return num_traits::Euclid::rem_euclid(&self, &b);
+    }
+}
+
+/// Return an FitResult that can be used to render an image in a buffer that matches a given ImageFit
 pub fn fit(
     image_fit: ImageFit,
     target: euclid::Size2D<f32, PhysicalPx>,
-    mut source_rect: IntRect,
+    source_rect: IntRect,
     scale_factor: ScaleFactor,
     alignment: (ImageHorizontalAlignment, ImageVerticalAlignment),
+    tiling: (ImageTiling, ImageTiling),
 ) -> FitResult {
+    let has_tiling = tiling != (ImageTiling::None, ImageTiling::None);
     let o = source_rect.size.cast::<f32>();
-    let mut offset = Default::default();
     let ratio = match image_fit {
+        // If there is any tiling, we ignore image_fit
+        _ if has_tiling => scale_factor.get(),
         ImageFit::Fill => {
             return FitResult {
                 clip_rect: source_rect,
                 source_to_target_x: target.width / o.width,
                 source_to_target_y: target.height / o.height,
                 size: target,
-                offset,
+                offset: Default::default(),
+                tiled: None,
             }
         }
+        ImageFit::Preserve => scale_factor.get(),
         ImageFit::Contain => f32::min(target.width / o.width, target.height / o.height),
         ImageFit::Cover => f32::max(target.width / o.width, target.height / o.height),
-        ImageFit::Preserve => scale_factor.get(),
     };
 
-    let mut size = euclid::Size2D::from_untyped(o * ratio);
-    if (o.width as f32) > target.width / ratio {
-        let diff = (o.width as f32 - target.width / ratio) as i32;
-        source_rect.size.width -= diff;
-        source_rect.origin.x += match alignment.0 {
-            ImageHorizontalAlignment::Center => diff / 2,
-            ImageHorizontalAlignment::Left => 0,
-            ImageHorizontalAlignment::Right => diff,
-        };
-        size.width = target.width;
-    } else if (o.width as f32) < target.width / ratio {
-        offset.x = match alignment.0 {
-            ImageHorizontalAlignment::Center => (target.width - o.width as f32 * ratio) / 2.,
-            ImageHorizontalAlignment::Left => 0.,
-            ImageHorizontalAlignment::Right => target.width - o.width as f32 * ratio,
-        };
-    }
-    if (o.height as f32) > target.height / ratio {
-        let diff = (o.height as f32 - target.height / ratio) as i32;
-        source_rect.size.height -= diff;
-        source_rect.origin.y += match alignment.1 {
-            ImageVerticalAlignment::Center => diff / 2,
-            ImageVerticalAlignment::Top => 0,
-            ImageVerticalAlignment::Bottom => diff,
-        };
-        size.height = target.height;
-    } else if (o.height as f32) < target.height / ratio {
-        offset.y = match alignment.1 {
-            ImageVerticalAlignment::Center => (target.height - o.height as f32 * ratio) / 2.,
-            ImageVerticalAlignment::Top => 0.,
-            ImageVerticalAlignment::Bottom => target.height - o.height as f32 * ratio,
-        };
-    }
     FitResult {
         clip_rect: source_rect,
         source_to_target_x: ratio,
         source_to_target_y: ratio,
-        size,
-        offset,
+        size: target,
+        offset: euclid::Point2D::default(),
+        tiled: None,
     }
+    .adjust_for_tiling(ratio, alignment, tiling)
 }
 
 /// Generate an iterator of  [`FitResult`] for each slice of a 9slice border image
@@ -956,49 +1058,58 @@ pub fn fit9slice(
     [t, r, b, l]: [u16; 4],
     target: euclid::Size2D<f32, PhysicalPx>,
     scale_factor: ScaleFactor,
+    alignment: (ImageHorizontalAlignment, ImageVerticalAlignment),
+    tiling: (ImageTiling, ImageTiling),
 ) -> impl Iterator<Item = FitResult> {
     let fit_to = |clip_rect: euclid::default::Rect<u16>, target: euclid::Rect<f32, PhysicalPx>| {
-        (!clip_rect.is_empty() && !target.is_empty()).then(|| FitResult {
-            clip_rect: clip_rect.cast(),
-            source_to_target_x: target.width() / clip_rect.width() as f32,
-            source_to_target_y: target.height() / clip_rect.height() as f32,
-            size: target.size,
-            offset: target.origin,
+        (!clip_rect.is_empty() && !target.is_empty()).then(|| {
+            FitResult {
+                clip_rect: clip_rect.cast(),
+                source_to_target_x: target.width() / clip_rect.width() as f32,
+                source_to_target_y: target.height() / clip_rect.height() as f32,
+                size: target.size,
+                offset: target.origin,
+                tiled: None,
+            }
+            .adjust_for_tiling(scale_factor.get(), alignment, tiling)
         })
     };
     use euclid::rect;
     let sf = |x| scale_factor.get() * x as f32;
     let source = source_rect.cast::<u16>();
-
-    [
-        fit_to(rect(0, 0, l, t), rect(0., 0., sf(l), sf(t))),
-        fit_to(
-            rect(l, 0, source.width - l - r, t),
-            rect(sf(l), 0., target.width - sf(l) - sf(r), sf(t)),
-        ),
-        fit_to(rect(source.width - r, 0, r, t), rect(target.width - sf(r), 0., sf(r), sf(t))),
-        fit_to(
-            rect(0, t, l, source.height - t - b),
-            rect(0., sf(t), sf(l), target.height - sf(t) - sf(b)),
-        ),
-        fit_to(
-            rect(l, t, source.width - l - r, source.height - t - b),
-            rect(sf(l), sf(t), target.width - sf(l) - sf(r), target.height - sf(t) - sf(b)),
-        ),
-        fit_to(
-            rect(source.width - r, t, r, source.height - t - b),
-            rect(target.width - sf(r), sf(t), sf(r), target.height - sf(t) - sf(b)),
-        ),
-        fit_to(rect(0, source.width - b, l, b), rect(0., target.height - sf(b), sf(l), sf(b))),
-        fit_to(
-            rect(l, source.width - b, source.width - l - r, b),
-            rect(sf(l), target.height - sf(b), target.width - sf(l) - sf(r), sf(b)),
-        ),
-        fit_to(
-            rect(source.width - r, source.width - b, r, b),
-            rect(target.width - sf(r), target.height - sf(b), sf(r), sf(b)),
-        ),
-    ]
+    if t + b > source.height || l + r > source.width {
+        [None, None, None, None, None, None, None, None, None]
+    } else {
+        [
+            fit_to(rect(0, 0, l, t), rect(0., 0., sf(l), sf(t))),
+            fit_to(
+                rect(l, 0, source.width - l - r, t),
+                rect(sf(l), 0., target.width - sf(l) - sf(r), sf(t)),
+            ),
+            fit_to(rect(source.width - r, 0, r, t), rect(target.width - sf(r), 0., sf(r), sf(t))),
+            fit_to(
+                rect(0, t, l, source.height - t - b),
+                rect(0., sf(t), sf(l), target.height - sf(t) - sf(b)),
+            ),
+            fit_to(
+                rect(l, t, source.width - l - r, source.height - t - b),
+                rect(sf(l), sf(t), target.width - sf(l) - sf(r), target.height - sf(t) - sf(b)),
+            ),
+            fit_to(
+                rect(source.width - r, t, r, source.height - t - b),
+                rect(target.width - sf(r), sf(t), sf(r), target.height - sf(t) - sf(b)),
+            ),
+            fit_to(rect(0, source.height - b, l, b), rect(0., target.height - sf(b), sf(l), sf(b))),
+            fit_to(
+                rect(l, source.height - b, source.width - l - r, b),
+                rect(sf(l), target.height - sf(b), target.width - sf(l) - sf(r), sf(b)),
+            ),
+            fit_to(
+                rect(source.width - r, source.height - b, r, b),
+                rect(target.width - sf(r), target.height - sf(b), sf(r), sf(b)),
+            ),
+        ]
+    }
     .into_iter()
     .filter_map(|x| x)
 }

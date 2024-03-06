@@ -113,7 +113,7 @@ cpp! {{
             });
         }
 
-        void resizeEvent(QResizeEvent *event) override {
+        void resizeEvent(QResizeEvent *) override {
             if (!rust_window)
                 return;
 
@@ -1239,6 +1239,7 @@ impl QtItemRenderer<'_> {
                             IntRect::from_size(origin.cast()),
                             scale_factor,
                             Default::default(), // We only care about the size, so alignments don't matter
+                            image.tiling(),
                         )
                         .size
                         .cast(),
@@ -1277,6 +1278,8 @@ impl QtItemRenderer<'_> {
                 nine.1,
                 size * scale_factor,
                 scale_factor,
+                image.alignment(),
+                image.tiling(),
             )
             .collect::<Vec<_>>()
         } else {
@@ -1286,6 +1289,7 @@ impl QtItemRenderer<'_> {
                 source_rect,
                 scale_factor,
                 image.alignment(),
+                image.tiling(),
             )]
         };
 
@@ -1305,17 +1309,38 @@ impl QtItemRenderer<'_> {
 
             let painter: &mut QPainterPtr = &mut self.painter;
             let smooth: bool = image.rendering() == ImageRendering::Smooth;
-            cpp! { unsafe [
-                    painter as "QPainterPtr*",
-                    pixmap as "QPixmap",
-                    source_rect as "QRectF",
-                    dest_rect as "QRectF",
-                    smooth as "bool"] {
-                (*painter)->save();
-                (*painter)->setRenderHint(QPainter::SmoothPixmapTransform, smooth);
-                (*painter)->drawPixmap(dest_rect, pixmap, source_rect);
-                (*painter)->restore();
-            }};
+            if let Some(offset) = fit.tiled {
+                let scale_x: f32 = fit.source_to_target_x;
+                let scale_y: f32 = fit.source_to_target_y;
+                let offset = qttypes::QPoint { x: offset.x as _, y: offset.y as _ };
+                cpp! { unsafe [
+                    painter as "QPainterPtr*", pixmap as "QPixmap", source_rect as "QRectF",
+                    dest_rect as "QRectF", smooth as "bool", scale_x as "float", scale_y as "float",
+                    offset as "QPoint"
+                    ] {
+                        (*painter)->save();
+                        (*painter)->setRenderHint(QPainter::SmoothPixmapTransform, smooth);
+                        auto transform = QTransform::fromScale(1 / scale_x, 1 / scale_y);
+                        auto scaled_destination = (dest_rect * transform).boundingRect();
+                        QPixmap source_pixmap = pixmap.copy(source_rect.toRect());
+                        (*painter)->scale(scale_x, scale_y);
+                        (*painter)->drawTiledPixmap(scaled_destination, source_pixmap, offset);
+                        (*painter)->restore();
+                    }
+                };
+            } else {
+                cpp! { unsafe [
+                        painter as "QPainterPtr*",
+                        pixmap as "QPixmap",
+                        source_rect as "QRectF",
+                        dest_rect as "QRectF",
+                        smooth as "bool"] {
+                    (*painter)->save();
+                    (*painter)->setRenderHint(QPainter::SmoothPixmapTransform, smooth);
+                    (*painter)->drawPixmap(dest_rect, pixmap, source_rect);
+                    (*painter)->restore();
+                }};
+            }
         }
     }
 

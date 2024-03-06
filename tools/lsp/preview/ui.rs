@@ -47,6 +47,7 @@ pub fn create_ui(style: String, experimental: bool) -> Result<PreviewUi, Platfor
     ui.on_can_drop(super::can_drop_component);
     ui.on_drop(super::drop_component);
     ui.on_selected_element_update_geometry(super::change_geometry_of_selected_element);
+    ui.on_selected_element_delete(super::delete_selected_element);
 
     Ok(ui)
 }
@@ -74,23 +75,14 @@ pub fn convert_diagnostics(diagnostics: &[slint_interpreter::Diagnostic]) -> Vec
 
 pub fn ui_set_known_components(
     ui: &PreviewUi,
-    current_url: &Option<lsp_types::Url>,
     known_components: &[crate::common::ComponentInformation],
 ) {
-    let mut map: HashMap<String, Vec<ComponentListSubItem>> = Default::default();
+    let mut map: HashMap<String, Vec<slint::SharedString>> = Default::default();
     for ci in known_components {
         if ci.is_global {
             continue;
         }
-        let import_file = ci.import_file_name(current_url).unwrap_or_default();
-        map.entry(ci.category.clone()).or_default().push(ComponentListSubItem {
-            name: ci.name.clone().into(),
-            import_file: import_file.into(),
-            is_builtin: ci.is_builtin,
-            is_std_widget: ci.is_std_widget,
-            is_layout: ci.is_layout,
-            is_exported: ci.is_exported,
-        });
+        map.entry(ci.category.clone()).or_default().push(ci.name.clone().into());
     }
     let mut result = map
         .into_iter()

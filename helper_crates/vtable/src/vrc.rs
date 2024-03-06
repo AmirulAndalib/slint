@@ -29,7 +29,8 @@ pub unsafe trait VTableMetaDropInPlace: VTableMeta {
 
 /// This is a marker type to be used in [`VRc`] and [`VWeak`] to mean that the
 /// actual type is not known.
-pub struct Dyn(());
+// Note the use of PhantomData to make this type not Send, as a VRc<T, Dyn> cannot be send between thread
+pub struct Dyn(PhantomData<*mut ()>);
 
 /// Similar to [`core::alloc::Layout`], but `repr(C)`
 #[repr(C)]
@@ -106,7 +107,7 @@ impl<VTable: VTableMetaDropInPlace + 'static, X> Drop for VRc<VTable, X> {
                 let data =
                     (inner as *mut u8).add(*core::ptr::addr_of!((*inner).data_offset) as usize);
                 let vtable = core::ptr::addr_of!((*inner).vtable);
-                let mut layout = VTable::drop_in_place(&*vtable, data);
+                let mut layout = VTable::drop_in_place(*vtable, data);
                 layout = core::alloc::Layout::new::<VRcInner<VTable, ()>>()
                     .extend(layout.try_into().unwrap())
                     .unwrap()
@@ -121,7 +122,7 @@ impl<VTable: VTableMetaDropInPlace + 'static, X> Drop for VRc<VTable, X> {
                         as *mut Layout) = layout;
                 }
                 if (*core::ptr::addr_of!((*inner).weak_ref)).fetch_sub(1, Ordering::SeqCst) == 1 {
-                    VTable::dealloc(&*vtable, self.inner.cast().as_ptr(), layout);
+                    VTable::dealloc(*vtable, self.inner.cast().as_ptr(), layout);
                 }
             }
         }
@@ -270,8 +271,14 @@ impl<VTable: VTableMetaDropInPlace, X /*+ HasStaticVTable<VTable>*/> Deref for V
 }
 
 // Safety: we use atomic reference count for the internal things
-unsafe impl<VTable: VTableMetaDropInPlace + 'static, X: Send + Sync> Send for VRc<VTable, X> {}
-unsafe impl<VTable: VTableMetaDropInPlace + 'static, X: Send + Sync> Sync for VRc<VTable, X> {}
+unsafe impl<VTable: VTableMetaDropInPlace + Send + Sync + 'static, X: Send + Sync> Send
+    for VRc<VTable, X>
+{
+}
+unsafe impl<VTable: VTableMetaDropInPlace + Send + Sync + 'static, X: Send + Sync> Sync
+    for VRc<VTable, X>
+{
+}
 
 /// Weak pointer for the [`VRc`] where `VTable` is a VTable struct, and
 /// `X` is the type of the instance, or [`Dyn`] if it is not known

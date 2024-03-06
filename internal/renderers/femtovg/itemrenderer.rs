@@ -73,10 +73,10 @@ pub struct GLItemRenderer<'a> {
     texture_cache: &'a RefCell<super::images::TextureCache>,
     box_shadow_cache: FemtovgBoxShadowCache,
     canvas: CanvasRc,
-    // Layers that were scheduled for rendering where we can't delete the femtovg::ImageId yet
+    // Textures from layering or tiling that were scheduled for rendering where we can't delete the femtovg::ImageId yet
     // because that can only happen after calling `flush`. Otherwise femtovg ends up processing
     // `set_render_target` commands with image ids that have been deleted.
-    layer_images_to_delete_after_flush: RefCell<Vec<Rc<super::images::Texture>>>,
+    textures_to_delete_after_flush: RefCell<Vec<Rc<super::images::Texture>>>,
     window: &'a i_slint_core::api::Window,
     scale_factor: ScaleFactor,
     /// track the state manually since femtovg don't have accessor for its state
@@ -721,7 +721,7 @@ impl<'a> ItemRenderer for GLItemRenderer<'a> {
 
                     self.canvas.borrow_mut().set_render_target(blurred_image.as_render_target());
 
-                    self.layer_images_to_delete_after_flush.borrow_mut().push(shadow_image);
+                    self.textures_to_delete_after_flush.borrow_mut().push(shadow_image);
 
                     blurred_image
                 } else {
@@ -1067,7 +1067,7 @@ impl<'a> GLItemRenderer<'a> {
             texture_cache,
             box_shadow_cache: Default::default(),
             canvas: canvas.clone(),
-            layer_images_to_delete_after_flush: Default::default(),
+            textures_to_delete_after_flush: Default::default(),
             window,
             scale_factor,
             state: vec![State {
@@ -1289,22 +1289,23 @@ impl<'a> GLItemRenderer<'a> {
                 let image_inner: &ImageInner = (&image).into();
 
                 let target_size_for_scalable_source = if image_inner.is_svg() {
-                    let image_size = image.size();
+                    let image_size = image.size().cast::<f32>();
                     if image_size.is_empty() {
                         return None;
                     }
                     let t = item.target_size() * self.scale_factor;
-                    Some(
-                        i_slint_core::graphics::fit(
-                            item.image_fit(),
-                            t,
-                            IntRect::from_size(image_size.cast()),
-                            self.scale_factor,
-                            Default::default(), // We only care about the size, so alignments don't matter
-                        )
-                        .size
-                        .cast(),
-                    )
+                    let fit = i_slint_core::graphics::fit(
+                        item.image_fit(),
+                        t,
+                        IntRect::from_size(image_size.cast()),
+                        self.scale_factor,
+                        Default::default(), // We only care about the size, so alignments don't matter
+                        item.tiling(),
+                    );
+                    Some(euclid::size2(
+                        (image_size.width * fit.source_to_target_x) as u32,
+                        (image_size.height * fit.source_to_target_y) as u32,
+                    ))
                 } else {
                     None
                 };
@@ -1359,11 +1360,12 @@ impl<'a> GLItemRenderer<'a> {
             break cached_image.as_texture().clone();
         };
 
-        let image_id = cached_image.id;
-        let image_size = cached_image.size().unwrap_or_default();
-        let source_clip_rect = item.source_clip().unwrap_or(IntRect::from_size(image_size.cast()));
-
         let image = item.source();
+        let image_id = cached_image.id;
+        let orig_size = image.size().cast::<f32>();
+        let buf_size = cached_image.size().unwrap_or_default().cast::<f32>();
+        let source_clip_rect = item.source_clip().unwrap_or(IntRect::from_size(orig_size.cast()));
+
         let image_inner: &ImageInner = (&image).into();
         let fits = if let ImageInner::NineSlice(nine) = image_inner {
             i_slint_core::graphics::fit9slice(
@@ -1371,6 +1373,8 @@ impl<'a> GLItemRenderer<'a> {
                 nine.1,
                 size * self.scale_factor,
                 self.scale_factor,
+                item.alignment(),
+                item.tiling(),
             )
             .collect::<Vec<_>>()
         } else {
@@ -1380,29 +1384,93 @@ impl<'a> GLItemRenderer<'a> {
                 source_clip_rect,
                 self.scale_factor,
                 item.alignment(),
+                item.tiling(),
             )]
         };
 
+        let scale_w = buf_size.width / orig_size.width;
+        let scale_h = buf_size.height / orig_size.height;
+
         for fit in fits {
+            let (image_id, origin, texture_size) =
+                if fit.tiled.is_some() && fit.clip_rect.size.cast() != orig_size {
+                    let scaling_flags = match item.rendering() {
+                        ImageRendering::Smooth => femtovg::ImageFlags::empty(),
+                        ImageRendering::Pixelated => {
+                            femtovg::ImageFlags::empty() | femtovg::ImageFlags::NEAREST
+                        }
+                    };
+                    let texture_size = euclid::size2(
+                        scale_w * fit.clip_rect.width() as f32,
+                        scale_h * fit.clip_rect.height() as f32,
+                    );
+
+                    let clipped_image = self
+                        .canvas
+                        .borrow_mut()
+                        .create_image_empty(
+                            texture_size.width as usize,
+                            texture_size.height as usize,
+                            femtovg::PixelFormat::Rgba8,
+                            femtovg::ImageFlags::PREMULTIPLIED
+                                | femtovg::ImageFlags::REPEAT_X
+                                | femtovg::ImageFlags::REPEAT_Y
+                                | scaling_flags,
+                        )
+                        .expect("internal error allocating temporary texture for image tiling");
+
+                    let mut image_rect = femtovg::Path::new();
+                    image_rect.rect(0., 0., texture_size.width, texture_size.height);
+                    self.canvas.borrow_mut().save_with(|canvas| {
+                        canvas.reset();
+                        canvas.scale(1., -1.); // Image are rendered upside down
+                        canvas.translate(0., -scale_h * (fit.clip_rect.height() as f32));
+                        canvas.set_render_target(femtovg::RenderTarget::Image(clipped_image));
+                        canvas.global_composite_operation(femtovg::CompositeOperation::Copy);
+                        canvas.fill_path(
+                            &image_rect,
+                            &femtovg::Paint::image(
+                                image_id,
+                                -scale_w * fit.clip_rect.origin.x as f32,
+                                -scale_h * fit.clip_rect.origin.y as f32,
+                                buf_size.cast().width,
+                                buf_size.cast().height,
+                                0.,
+                                1.0,
+                            ),
+                        );
+                        canvas.set_render_target(self.current_render_target());
+                    });
+                    self.textures_to_delete_after_flush
+                        .borrow_mut()
+                        .push(Texture::adopt(&self.canvas, clipped_image));
+                    (clipped_image, Default::default(), texture_size)
+                } else {
+                    (image_id, fit.clip_rect.origin.cast::<f32>(), buf_size)
+                };
+            let tiled = fit.tiled.unwrap_or_default();
             let fill_paint = femtovg::Paint::image(
                 image_id,
-                -fit.clip_rect.origin.x as _,
-                -fit.clip_rect.origin.y as _,
-                image_size.cast().width,
-                image_size.cast().height,
+                -origin.x - tiled.x as f32,
+                -origin.y - tiled.y as f32,
+                texture_size.width,
+                texture_size.height,
                 0.0,
                 1.0,
             )
-            // We preserve the rectangular shape of the image, so there's no need to apply anti-aliasing
-            // at the edges
-            .with_anti_alias(false);
+            .with_anti_alias(fit.source_to_target_x != 1. || fit.source_to_target_y != 0.);
 
             let mut path = femtovg::Path::new();
-            path.rect(0., 0., fit.clip_rect.width() as _, fit.clip_rect.height() as _);
+            path.rect(
+                0.,
+                0.,
+                scale_w * fit.size.width / fit.source_to_target_x,
+                scale_h * fit.size.height / fit.source_to_target_y,
+            );
 
             self.canvas.borrow_mut().save_with(|canvas| {
                 canvas.translate(fit.offset.x, fit.offset.y);
-                canvas.scale(fit.source_to_target_x, fit.source_to_target_y);
+                canvas.scale(fit.source_to_target_x / scale_w, fit.source_to_target_y / scale_h);
                 canvas.fill_path(&path, &fill_paint);
             })
         }
